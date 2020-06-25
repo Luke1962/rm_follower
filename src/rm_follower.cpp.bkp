@@ -1,0 +1,661 @@
+/*
+Nodo che sottoscrive   dnn_detect::DetectedObjectArray
+e genera cmd_vel, raspicam_tilt
+
+
+Build : catkin_make  -DCATKIN_WHITELIST_PACKAGES="rm_follower"
+        richiede ros_arduino per i messaggi
+Launch:  roslaunch rm_follower rm_follower.launch
+*/
+
+#define MINIMUMSPEED 0.15 //velocità minima per spostarsi linearmente
+
+//#include <assert.h>
+#include <sys/time.h>
+//#include <unistd.h>
+
+#include <ros/ros.h>
+
+// Actionlib
+// =======================================================================
+#include <actionlib/client/simple_action_client.h>
+#include <actionlib/client/terminal_state.h>
+#include <move_base_msgs/MoveBaseAction.h>
+
+typedef actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction>
+    MoveBaseClient;
+
+// This includes action message generated from the Move.action file.
+// This is a header generated automatically from the AveragingAction.msg file.
+// For more information on message definitions, see the msg page.
+// il nome dell'include è [Nome senza .action]Action.h
+#include <rm_follower/MoveAction.h>
+
+//================================================================================
+
+#include <boost/algorithm/string.hpp>
+#include <list>
+#include <string>
+
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
+#include "dnn_detect/DetectedObject.h"
+#include "dnn_detect/DetectedObjectArray.h"
+#include <geometry_msgs/Point.h>      // posizione persona
+#include <geometry_msgs/Twist.h>      // comandi
+#include <ros/transport_hints.h>      // per tcp_nodelay
+#include <ros_arduino_msgs/Digital.h> //pir
+#include <sensor_msgs/CameraInfo.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Int16.h>
+#include <std_msgs/String.h>
+
+//#include "PID_v1.h"
+//#include <afsm/fsm.hpp>
+
+using namespace std;
+
+std::condition_variable cond;
+std::mutex mutx;
+
+enum status_e {
+  // STATI
+  IDLE = 0,
+  SEARCHING,
+  TRACKING,
+  // TRANSIZIONI AMMESSE
+  START_IDLE,
+  IDLE_SEARCHING,     // quando riceve PIR=1
+  SEARCHING_IDLE,     // qunado non trova detections
+  SEARCHING_TRACKING, // su callback detection
+  TRACKING_SEARCHING  // quando perde la detection
+
+};
+
+
+enum direction_e
+{
+DESTRA,
+SINISTRA,
+AVANTI,
+INDIETRO,
+CENTRATO
+};
+
+template <typename T> int sgn(T val) { return (T(0) < val) - (val < T(0)); }
+////////////////////////////////////////////////////////////////////////////////////
+// mappa 'value' espresso nel range [istart,istop] nel dominio [ostart,ostop]
+float remap(float value, float istart, float istop, float ostart, float ostop) {
+  return ostart + (ostop - ostart) * ((value - istart) / (istop - istart));
+}
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// calcola l'angolo sulla base della distanza in pixel dal centro immagine
+float cameraPixel2Alfa_H(int pixelFromCenter, float cameraHFOV, int imageW,
+                         float absMaxRotationSpeed) {
+
+  // da
+  // https://math.stackexchange.com/questions/1320285/convert-a-pixel-displacement-to-angular-rotation
+  return atan(tan(cameraHFOV / 2) * 2 * pixelFromCenter / imageW);
+
+  /*
+      float sp = absMaxRotationSpeed*distanceFromCenter/(0.25*imageW);
+      if (sp > absMaxRotationSpeed)
+      {
+          return sp;
+      }else
+          return absMaxRotationSpeed;
+  */
+}
+///////////////////////////////////////////////////////////////////////////////////////mnt
+
+#define STOP                                                                   \
+  msg_cmdvel.linear.x = 0;                                                     \
+  msg_cmdvel.linear.y = 0;                                                     \
+  msg_cmdvel.angular.z = 0;                                                    \
+  pub_cmdvel.publish(msg_cmdvel);                                              \
+  printf("\n\tSTOP");
+
+//#define CMDVEL(lin,ang)  ( msg_cmdvel.linear.x = lin;msg_cmdvel.linear.y = 0;msg_cmdvel.angular.z = ang;pub_cmdvel.publish(msg_cmdvel);)   
+  //printf("\n\t cmd_vel[%f,%f]", (float)lin, (float)ang);
+
+class Follower {
+private:
+	//----------------------------------------------------------------------
+	// mie aggiunte
+	//----------------------------------------------------------------------
+
+	geometry_msgs::Point detectedPerson; // persona piu vicina
+
+	void speech(string msg);
+	float width2distance;
+	float w2dist(int w, int imgW);
+	bool isNewDetection;
+	float trackRotationSpeed;
+	float searchRotationSpeed;
+	float trackLinerarSpeed;
+	float rate;
+	int thresholdCenter;
+	std::string cmdvel_topic;
+	std::string camerainfo_topic;
+
+	float tooFarFactor;
+	float tooNearFactor;
+	int searchRotationDir = 1; // direzione di rotazione di ricerca
+	int lastdetection2stop_sec =
+	  10; // secondo dopo l'ultima detection per fermarsi
+	int lastDetection2search_sec;
+
+	// Dati webcam
+	int imageW;
+	int imageH;
+	float cameraHFOV; // angolo di visuale orizzontale
+
+	// messaggi ROS
+	geometry_msgs::Point msg_personPosition;
+	geometry_msgs::Twist msg_cmdvel;
+	ros::Time detect_time_last; // quando è occorsa l'ultima detection
+
+	ros::Publisher pub_cmdvel;
+	ros::Publisher pub_chatter;
+	ros::Publisher pub_raspicamtilt;
+	ros::Publisher pub_faretto;
+
+	std_msgs::String msg_chatter;
+
+
+	bool blWarnSearching = true;
+	bool blWarnNoDetect = true; // attiva il warning che non vede nessuno e quindi
+							  // si ferma. resettato dal primo messaggio di
+							  // warning e attivato dalle detections
+
+	bool debug_onlyRotation= false;
+	uint8_t pir; // true se rileva presenza umana
+								  // void cbk_pir(const std_msgs::Bool &msg);
+	void cbk_pir(const ros_arduino_msgs::Digital &msg);
+	ros::Subscriber sub_pir;
+
+	void cbk_camerainfo(const sensor_msgs::CameraInfo);
+	ros::Subscriber sub_camerainfo;
+
+	void
+	cbk_detectedObjects(const dnn_detect::DetectedObjectArray &detectionArray);
+	ros::Subscriber sub_detectedObjects;
+	float min_confidence;
+
+	status_e status;
+
+	void enter_IDLE();
+	void enter_SEARCHING();
+	void track(geometry_msgs::Point detectedPerson);
+
+	void CMDVEL(float lin, float ang);
+	
+	bool blWarnAvanti = true;
+	bool blWarnIndietro = true;
+	bool blWarnDestra = true;
+	bool blWarnSinistra = true;
+	bool blWarnCentrato = true;	
+	void speechOnce( direction_e  direction);
+	direction_e lastWarningDirection;
+  //----------------------------------------------------------------------
+public:
+	Follower(ros::NodeHandle &nh);
+};
+
+
+void Follower::CMDVEL(float lin, float ang){
+ msg_cmdvel.linear.x = lin;
+ msg_cmdvel.linear.y = 0;
+ msg_cmdvel.angular.z = ang;
+ pub_cmdvel.publish(msg_cmdvel);
+}
+/////////////////////////////////////////
+/*
+ * Converte l'indice di riga in distanza
+ * in :w = dimensione oggetto in pixel
+ * out: distanza in cm in corrispondenza della colonna del picco luminoso
+ * */
+float Follower::w2dist(int w, int imgW) {
+  // r=0 massima distanza
+  // r = IMG_H  minima distanza
+
+  float d = 0.0; // distanza stimata
+
+  if (w > imgW) {
+    w = imgW;
+  }
+  if (w <= 0) {
+    w = 0;
+  }
+
+  if (w > 0) {
+
+    d = 1; // to do
+
+  } else {
+    d = -1; // -1 =  dato non valido
+  }
+
+  return d;
+}
+void Follower::speech(std::string msg) {
+  msg_chatter.data = msg;
+  pub_chatter.publish(msg_chatter);
+  //ROS_INFO("[SPEECH] %s", msg.c_str());
+}
+
+void Follower::cbk_camerainfo(sensor_msgs::CameraInfo camerainfo) {
+  imageW = camerainfo.width;
+  imageH = camerainfo.height;
+  ROS_INFO_THROTTLE(1,"Received Camera_info. Size: %d x %d", imageW, imageH);
+  ROS_INFO_THROTTLE(1,"Left region x: [0..%d] Right region: [%d..%d]", imageW/2-thresholdCenter, imageW/2+thresholdCenter , imageW);
+    
+}
+
+/////////////////////////////////////////
+// I D L E
+/////////////////////////////////////////
+void Follower::enter_IDLE() {
+  ROS_INFO_THROTTLE(5.0, "[IDLE] Waiting for PIR signal");
+
+  // esce da IDLE in seguito a un callback PIR
+}
+
+/////////////////////////////////////////
+// S EA R C H I N G
+/////////////////////////////////////////
+void Follower::enter_SEARCHING() {
+	float  rot = (float)searchRotationSpeed * searchRotationDir;
+	ROS_INFO_THROTTLE(1, "[SEARCHING] rotation at %f rad/s", rot);
+  	CMDVEL(0.0, rot );
+}
+
+/////////////////////////////////////////
+// T R A C K
+/////////////////////////////////////////
+// chiamato dal callback della detection
+void Follower::track(geometry_msgs::Point detectedPerson) {
+
+
+	float_t distanceFromCenter =detectedPerson.x - (float_t)imageW/2 ; // >0 significa a Destra; <0 SX
+	if (distanceFromCenter > 0 ){
+		searchRotationDir = -1; // CW , verso destra
+	}
+	else{
+		searchRotationDir = 1;	// CCW , verso sinistra
+	};
+	ROS_INFO( "Dist from center: %f",distanceFromCenter);
+	//float angleFromCenter_rad = cameraPixel2Alfa_H(distanceFromCenter, cameraHFOV, imageW, trackRotationSpeed);
+
+	// Calcolo la velocità di rotazione proporzionale alla distanza dal centro
+	// 0.3 è la velocità minima al di sotto della quale non si muove proprio
+	/*
+		float cmd_vel_rot =
+		  (float)searchRotationDir *
+		  remap(
+				abs(distanceFromCenter), 
+				0.0 , (imageW- detectedPerson.z) / 2, 
+				0.3f ,  (float)trackRotationSpeed
+				) ;
+		*/
+
+	if (fabs(distanceFromCenter) <= thresholdCenter) {// persona al centro	-> non ruoto
+    
+		ROS_INFO( "Detection al centro ");
+		
+		// stabilisco la velocità lineare
+		if ((float)detectedPerson.z > tooNearFactor * (float)imageW) { // troppo vicino ?
+			ROS_INFO( "... troppo vicino ");
+			 // indietreggio lentamente
+			float speed = max(-trackLinerarSpeed *0.7, -MINIMUMSPEED);      
+			CMDVEL(speed, 0.0);
+			speechOnce((direction_e)INDIETRO);
+
+		} else if ((float)detectedPerson.z < tooFarFactor * imageW) { // troppo lontano?
+			ROS_INFO( "... troppo lontano ");
+			CMDVEL(trackLinerarSpeed, 0.0);
+			speechOnce((direction_e)AVANTI);
+
+    	} else {
+
+			STOP;
+
+ 			speechOnce((direction_e)CENTRATO);
+		}
+
+	} 
+	else //distanza oltre banda centrale ->ruoto
+	{
+	  
+		float cmd_vel_rot = (float)trackRotationSpeed*searchRotationDir;
+		
+		CMDVEL(0.0, cmd_vel_rot);
+		ROS_INFO("Rotation %f rad/sec",cmd_vel_rot); 
+		if (detectedPerson.x > imageW/2) {// è a DX (CCW) 
+			
+			speechOnce((direction_e)DESTRA);
+		} 
+		else 
+		{ //e' a sinistra
+			speechOnce((direction_e)SINISTRA);
+		}
+	}
+}
+
+
+
+// void Follower::cbk_pir(const std_msgs::Bool & msg){
+void Follower::cbk_pir(const ros_arduino_msgs::Digital &msg) {
+  if (pir != msg.value) {
+    pir = msg.value;
+    ROS_INFO("PIR changed to %d", msg.value);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Vengono calcolati:
+// a) le coordinate di  detectedPerson (float32!)
+// b) status = SEARCHING_TRACKING o TRACKING;
+/////////////////////////////////////////////////////////////////////////////
+void Follower::cbk_detectedObjects(
+    const dnn_detect::DetectedObjectArray &detectionArray) {
+	dnn_detect::DetectedObject obj; // oggetto corrente
+	int detectionCenterX = 0;       //= ( (float)x_min +(float)x_max ) / 2;
+	int detectionSize = 0;          //= (float)(x_max - x_min);
+	
+	// Verifico se le detections contengono almeno  una persona
+	// individua la persona da seguire -se presente- tra le varie detections
+	bool isPersonDetected = false;
+	float_t x_min, x_max, y_min, y_max;
+	for (int i = 0; i < detectionArray.objects.size(); i++) {
+		obj = detectionArray.objects[i];
+		if (obj.class_name.compare("person")==0) {
+			ROS_INFO("cbk dnn_detect [%s] at x [%f,%f]", obj.class_name.c_str() ,obj.x_min,obj.x_max);
+
+			if (obj.confidence > min_confidence) {
+				isPersonDetected = true;
+				detectionSize =(float)obj.x_max - (float)obj.x_min ;
+				// se la persona è più vicina della detection precedente..
+				if (detectionSize > detectedPerson.z) {
+					//la memorizzo
+					detectedPerson.x = ((float)obj.x_min + (float)obj.x_max) / 2;
+					detectedPerson.y = (obj.y_min + obj.y_max) / 2 ;
+					detectedPerson.z = detectionSize;
+					ROS_INFO("\t\t person: x[%f,%f] y[%f,%f]", obj.x_min,obj.x_max, obj.y_min , obj.y_max);
+				}
+				
+
+
+			} // if confidence
+			else {
+				ROS_INFO("person confidence level %f below minimum %f",obj.confidence, min_confidence);
+			}
+
+		} // if person
+
+	} // end for each detection
+
+		// calcolo centro
+		detectionCenterX = detectedPerson.x;
+		detectionSize = detectedPerson.z;
+
+
+	if (isPersonDetected) {
+		detect_time_last = ros::Time::now();
+		blWarnNoDetect = true;
+
+		////////////////////////////////////////////////////
+		/// esegue il tracking 
+		////////////////////////////////////////////////////
+		int detectionCenterX = detectedPerson.x;
+		int detectionSize = detectedPerson.z;
+		int detectionHeight = detectedPerson.z;
+		ROS_INFO_THROTTLE(1,"Detected person at x: %d",detectionCenterX);
+
+		track(detectedPerson);
+		////////////////////////////////////////////////////
+
+		// aggiorno lo stato
+		if ((status == SEARCHING) || (status == IDLE)) {		status = SEARCHING_TRACKING;
+		} else if (status == SEARCHING_TRACKING) {		status = TRACKING;
+		} else if (status == TRACKING) {
+			/* nessuna azione */
+			ROS_INFO_THROTTLE(1,"Continue tracking");
+		}
+
+	} // end isPersonDetected
+
+  // se non ci sono persone non faccio nulla
+}
+//avvisa una sola volta di dove si trova la persona detettata
+void Follower::speechOnce( direction_e  direction){
+
+	if (direction != lastWarningDirection) {
+
+		switch (direction) {
+		
+		
+		case DESTRA:
+			speech("sei a destra");
+			ROS_INFO("sei a destra");		
+			break;
+			
+		case SINISTRA:
+			speech("sei a sinistra");
+			ROS_INFO("sei a sinistra");
+			break;
+
+		case AVANTI:
+			speech("sei lontano");
+			ROS_INFO("sei lontano");		  	
+			break;
+		
+		case INDIETRO:
+			speech("sei troppo vicino");
+			ROS_INFO("sei troppo vicino");    	
+			break;
+			
+		case CENTRATO:
+			speech("OK non ti muovere. Sono stanco di inseguirti");
+			ROS_INFO("OK non ti muovere. Sono stanco di inseguirti");   	
+			break;
+
+		default:
+			break;
+		}
+
+		lastWarningDirection = direction;
+	}
+}
+////////////////////////////////////////////////////
+/// Entry point del nodo
+////////////////////////////////////////////////////
+Follower::Follower(ros::NodeHandle &nh) {
+
+	// miei parametri -----------------
+	nh.param<float>("rate", rate, 10);
+	nh.param<std::string>("cmdvel_topic", cmdvel_topic, "/cmd_vel");
+	nh.param<std::string>("camerainfo_topic", camerainfo_topic, "/robot/raspicam");
+	nh.param<float>("width2distance", width2distance, 0.007843f);
+	nh.param<float>("trackRotationSpeed", trackRotationSpeed, 1.3);
+	nh.param<float>("searchRotationSpeed", searchRotationSpeed, 1.0);
+	nh.param<float>("trackLinerarSpeed", trackLinerarSpeed, 0.2);
+	nh.param<int>("thresholdCenter", thresholdCenter, 30);
+	nh.param<float>("tooNearFactor", tooNearFactor, 0.7);
+	nh.param<float>("tooFarFactor", tooFarFactor, 0.4);
+
+
+	nh.param<float>("cameraHFOV", cameraHFOV, 1.570796327);
+	nh.param<int>("lastDetection2search_sec", lastDetection2search_sec, 5);
+	nh.param<int>("lastdetection2stop_sec", lastdetection2stop_sec,
+				10); // secondi per fermarsi ed entrate in hidle
+	nh.param<float>("min_confidence", min_confidence, 0.4);
+	nh.param<bool>("debug_onlyRotation", debug_onlyRotation, true);
+
+	if (debug_onlyRotation) {
+		trackLinerarSpeed=0.0;
+	}
+
+	detectedPerson.x = 0;
+	detectedPerson.y = 0;
+	detectedPerson.z = 0;
+	sub_detectedObjects =nh.subscribe("/dnn_objects", 1, &Follower::cbk_detectedObjects, this,
+				   			ros::TransportHints().tcpNoDelay()); // richiede #include <transport_hints.h>
+	sub_pir = nh.subscribe("/pir", 1, &Follower::cbk_pir, this,
+							ros::TransportHints().tcpNoDelay());
+
+	sub_camerainfo = nh.subscribe(camerainfo_topic, 1, &Follower::cbk_camerainfo, this);
+
+	pub_cmdvel = nh.advertise<geometry_msgs::Twist>(cmdvel_topic, 1);
+
+	pub_chatter = nh.advertise<std_msgs::String>("/chatter", 1); // mia aggiunta
+
+	// imposto l'angolo migliore per vedere le persone da vicino
+	std_msgs::Int16 raspicam_tilt_demand;
+	pub_raspicamtilt = nh.advertise<std_msgs::Int16>("/servo_raspicam", 1);
+	pub_faretto = nh.advertise<std_msgs::Bool>("/faretto", 1);
+
+	
+	raspicam_tilt_demand.data = 40;
+	pub_raspicamtilt.publish(raspicam_tilt_demand);
+	ros::spinOnce();
+	/*
+	// ACTION_LIB CLIENT --------------------------
+
+	  // crea il action client
+	  // passo nome server e  true -> causes the client to spin its own thread
+	  //
+	  //tell the action client that we want to spin a thread by default
+	  // http://wiki.ros.org/navigation/Tutorials/SendingSimpleGoals
+	  MoveBaseClient ac("move_base", true);
+	 //actionlib::SimpleActionClient<rm_follower::MoveAction>
+	 ac("move_action_server", true);
+
+
+	  // wait for the action server to start
+	  ROS_INFO("Waiting for action server to start.");
+	  ac.waitForServer(); //will wait for infinite time
+	  ROS_INFO("Action server started.");
+	  //----------------------------------------------
+
+	  // goal di test---------------------------
+	  move_base_msgs::MoveBaseGoal goal; //rm_follower::MoveAction goal;
+
+	  //we'll send a goal to the robot to move 1 meter forward
+	  goal.target_pose.header.frame_id = "base_link";
+	  goal.target_pose.header.stamp = ros::Time::now();
+
+	  goal.target_pose.pose.position.x = 0.05;
+	  goal.target_pose.pose.orientation.w = 1.0;
+
+
+	  // invio goal
+	  ac.sendGoal(goal);
+	  // attendo risultato
+	  ac.waitForResult();//ac.waitForResult(ros::Duration(5.0));
+	  if (ac.getState() == actionlib::SimpleClientGoalState::SUCCEEDED)
+		  printf("Yay! Goal raggiunto");
+	  printf("Current State: %s\n", ac.getState().toString().c_str());
+	  //------------------------------------------------------------
+	*/
+
+
+	lastWarningDirection= CENTRATO;
+	
+	// inizializzo ad un tempo molto prima di lastdetection2stop_sec prima di ora
+	detect_time_last =
+	  ros::Time::now() - ros::Duration(2 * lastdetection2stop_sec);
+
+	// ros::spinOnce();
+	ros::Rate rate(rate); // 2 =2hz
+
+	status = START_IDLE;
+
+	while (ros::ok()) {
+		// ros::Duration updateInterval = time_now -detect_time_last;
+		ros::Time time_now = ros::Time::now();
+
+		switch (status) {
+			case START_IDLE:
+				speech("Ok sono pronto");
+				status = IDLE;
+				break;
+
+			case IDLE:
+				enter_IDLE(); // solo ROS_INFO
+				if (pir) {
+					status = IDLE_SEARCHING;
+				}
+				break;
+
+			case IDLE_SEARCHING:
+				ROS_INFO("[IDLE -> SEARCHING]");
+				speech("Qualcuno si muove. ora lo seguo");
+				detect_time_last =	ros::Time::now(); // per non farlo tornare subito in IDLE
+				status = SEARCHING;
+				break;
+
+			case SEARCHING:
+				// ROS_INFO("[SEARCHING] ...");
+				// se non ho perso la detection da troppo tempo...
+				if (time_now <	detect_time_last + ros::Duration(lastdetection2stop_sec)) {
+					// passa in TRACKING solo tramite callback di una detection
+					enter_SEARCHING(); // cmd_vel
+				} else {
+					status = SEARCHING_IDLE;
+				}
+				break;
+				// ROS_INFO_THROTTLE (1.0, "[SEARCHING] ....");
+
+			case SEARCHING_TRACKING:
+				ROS_INFO("[SEARCHING -> TRACKING]");
+				status = TRACKING;
+				break;
+
+			case SEARCHING_IDLE:
+				STOP;
+				ROS_INFO("[SEARCHING -> IDLE]");
+				speech("Non vedo proprio nessuno  mi fermo");
+				status = IDLE;
+				break;
+
+			case TRACKING:
+				// se ho perso la detection da piu di lastDetection2search_sec ...
+				if (time_now >  (detect_time_last + ros::Duration(lastDetection2search_sec))) {
+					status = TRACKING_SEARCHING;
+				}
+				break;
+
+			case TRACKING_SEARCHING:
+				ROS_INFO("[TRACKING -> SEARCHING]");
+				// if (blWarnSearching) {
+				speech("Ti ho perso. provo a guardarmi intorno");
+				detect_time_last = ros::Time::now();
+				// blWarnSearching = false;
+				//}
+				status = SEARCHING;
+				break;
+
+			default:
+				break;
+		}
+
+		ros::spinOnce();
+		// rate.sleep();
+	}
+	ROS_INFO("----STOPPING----");
+	STOP;
+	ROS_INFO("----END FOLLOWER----");
+	
+}
+
+int main(int argc, char **argv) {
+  ros::init(argc, argv, "rm_follower");
+  ros::NodeHandle nh("~");
+
+  Follower node = Follower(nh);
+
+  return 0;
+}

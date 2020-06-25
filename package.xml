@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<package format="2">
+    <name>rm_follower</name>
+    <version>0.0.4</version>
+    <description>human follower based on DNN detection by Coral edgeTpu</description>
+
+    <maintainer email="lcesarini1962@gmail.com">Luca Cesarini</maintainer>
+    <maintainer email="lcesarini1962@gmail.com">Luca Cesarini</maintainer>
+
+    <license>BSD</license>
+
+    <author email="lcesarini1962@gmail.com">Luca Cesarini</author>
+
+    <buildtool_depend>catkin</buildtool_depend>
+
+    <depend>roscpp</depend>
+    <depend>tf2_geometry_msgs</depend>
+    <depend>tf2_ros</depend>
+    <depend>tf2</depend>
+ 
+    <depend>sensor_msgs</depend>
+
+
+    <depend>fiducial_msgs</depend>
+    <depend>dynamic_reconfigure</depend>
+    <depend>actionlib</depend>
+    <depend>actionlib_msgs</depend>
+    <depend>ros_arduino_msgs</depend>
+    <depend>vision_msgs</depend>
+    <depend>visualization_msgs</depend>
+    
+    <exec_depend>message_generation</exec_depend>
+
+</package>

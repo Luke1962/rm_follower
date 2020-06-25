@@ -1,0 +1,34 @@
+<!-- Run the dnn_detect node -->
+<launch>
+    <node pkg="rm_follower" name="rm_follower"   type="rm_follower" output="screen" respawn="false">
+
+<!--        <param name="start_followme"                value="false"/>    se true non attente /start_followme= true -->
+
+        <param name="min_confidence"                value="0.5"/>   
+
+        <param name="node_rate"                     value="10"/>   
+        <param name="cmdvel_topic"                  value="/cmd_vel" />
+		<param name="image_topic"					value="/robot/usbcam"/>
+		<param name="camerainfo_topic"				value="/robot/usbcam/camera_info"/>
+        <param name="width2distance"                value="0.007843f"/>   
+        <param name="searchRotationSpeed"           value="0.37"/>
+
+        <param name="thresholdCenter"               value="15"/> <!-- distanza massima in pixel dal centro immagine per non ruotare-->
+        <param name="tooFarFactor"                  value="0.4"/> <!-- 0.4 ,con immagine di 320,  significa  0.4x320=128pixel di larghezza-->
+        <param name="tooNearFactor"                 value="0.70"/> <!--256 fattore rispetto alla dimensione orizzontale dell'immagine-->
+        <param name="cameraHFOV"                    value="1,31"/>   <!--angolo apertura raspicam 90° = 1,570796327 ; PsEye 75°=1.131-->
+ 
+        <param name="lastDetection2search_sec"      value="10" />
+        <param name="lastdetection2stop_sec"        value="60" />
+ 
+        <param name="servocamera_startupangle_deg"  value="100" />
+         <param name="debug_onlyRotation"            value="false"/>  <!--se true non avanza ma segue solo ruotando-->      
+<!--
+		parametri che non servono piu 
+-->
+        <param name="trackRotationSpeed"            value="2"/>
+        <param name="trackLinerarSpeed"             value="0.2"/>  <!--velocità di avvicinamento-->
+
+    </node>
+
+</launch>
